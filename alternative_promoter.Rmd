@@ -1,0 +1,228 @@
+---
+title: "Alternative_promoter"
+author: "Quynh Nhu Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3   # Optional: Specify the depth of headers to include in the TOC
+  pdf_document:
+    toc: true
+    toc_depth: 3   # Optional: Specify the depth of headers to include in the TOC
+---
+
+# A complete workflow to identify alternative promoter usage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the necessary libraries
+
+```{r}
+library(proActiv)   # For promoter analysis
+library(gridExtra)  # For arranging multiple plots
+library(Rtsne)      # For t-SNE dimensionality reduction
+library(ggplot2)    # For creating plots and visualizations
+library(SummarizedExperiment)
+library(tidyr)
+library(biomaRt)
+```
+
+## Preparing promoter annotations
+
+```{r}
+## Define the GTF file path for promoter annotation
+gtf_file_hg19 <- 'C:/Users/lucia/OneDrive/Desktop/phD/annotation/gencode.v19.annotation.gtf.gz'
+file.exists(gtf_file_hg19) # Check if the GTF file exists
+
+## Prepare promoter annotation using the GTF file for Homo sapiens
+promoterAnnotation_gencode_v19_subset <- preparePromoterAnnotation(
+    file = gtf_file_hg19, 
+    species = 'Homo_sapiens'
+)
+
+## Define the TxDb file path for promoter annotation
+txdb_file_hg19 <- 'C:/Users/lucia/OneDrive/Desktop/phD/annotation/gencode.v19.annotation.gtf.sqlite'
+file.exists(txdb_file_hg19)# Check if the TxDb file exists
+
+## Load the TxDb object from the SQLite file
+txdb_hg19 <- loadDb(txdb_file_hg19)
+
+## Prepare promoter annotation using the TxDb object for Homo sapiens
+promoterAnnotation_gencode_v19_subset <- preparePromoterAnnotation(
+    txdb = txdb_hg19, 
+    species = 'Homo_sapiens'
+)
+```
+
+## Preparing input data
+
+```{r}
+## Define the directory path containing STAR junction files
+directory_path <- 'C:/Users/lucia/OneDrive/Desktop/phD/hg19_01092024'
+
+## List all files in the directory with full paths
+files <- list.files(directory_path, full.names = TRUE)
+files # Display the listed files
+
+## Define the experimental conditions for the samples
+condition <- c('HIGH', 'HIGH', 'HIGH', 'HIGH', 'HIGH', 'HIGH', 'HIGH', 'HIGH', 'HIGH', 
+                'LOW', 'LOW', 'LOW', 'LOW', 'LOW', 'LOW', 'LOW', 'LOW', 'LOW', 'LOW', 
+                'LOW', 'LOW')
+
+condition
+```
+
+## Identifying promoters
+
+```{r}
+## Assign the promoter annotation to a variable
+promoterAnnotation <- promoterAnnotation_gencode_v19_subset
+
+## Run the proActiv function to analyze promoter activity
+result <- proActiv(
+    files = files, 
+    promoterAnnotation = promoterAnnotation, 
+    condition = condition
+)
+
+## Display the result object
+show(result)
+```
+
+```{r}
+# Convert the rowData to a data frame
+row_data <- rowData(result)
+
+# Now convert the rowData to a data frame
+promoter_df <- as.data.frame(row_data)
+
+# Display the first few rows of the data frame
+promoter_df
+```
+
+```{r}
+## Remove single-exon transcripts/promoters by eliminating promoter counts that are NA
+result <- result[
+    complete.cases(assays(result)$promoterCounts), 
+]
+```
+
+### Promoter category proportion
+
+```{r}
+rdata <- rowData(result)
+## Create a long dataframe summarizing cell line and promoter class
+pdata1 <- data.frame(cellLine = rep(c('HIGH', 'LOW'), each = nrow(rdata)),
+                       promoterClass = as.factor(c(rdata$HIGH.class, rdata$LOW.class)))
+
+ggplot(na.omit(pdata1)) +
+  geom_bar(aes(x = cellLine, fill = promoterClass)) + 
+  xlab('Cell Lines') + ylab('Count') +  labs(fill = 'Promoter Category') +
+  ggtitle('Categorization of Promoters')
+```
+
+### t-SNE plot with all active promoters
+
+```{r}
+## Remove inactive promoters (sparse rows)
+data <- assays(result)$absolutePromoterActivity %>% dplyr::filter(rowSums(.) > 0)
+data <- data.frame(t(data))
+data
+data$Sample <- as.factor(condition)
+
+set.seed(40) # for reproducibility
+
+# Perform t-SNE
+tsne.out <- Rtsne(as.matrix(subset(data, select = -c(Sample))), perplexity = 1)
+tsne.out
+
+# Plot the t-SNE result
+plot(x = tsne.out$Y[,1], y = tsne.out$Y[,2], 
+     bg = data$Sample, asp = 1,
+     col = 'black', pch = 24, cex = 4,
+     main = 't-SNE plot with promoters \n active in at least one sample',
+     xlab = 'T-SNE1', ylab = 'T-SNE2',
+     xlim = c(-150,150), ylim = c(-150,150))
+
+legend('topright', inset = .02, title = 'Cell Lines',
+       legend = unique(condition), pch = 24, 
+       pt.bg = 1:length(unique(condition)), cex = 1.5, bty = 'n')
+```
+
+## Identifying alternative promoters
+
+```{r}
+alternativePromoters <- getAlternativePromoters(result = result, referenceCondition = "HIGH")
+show(alternativePromoters)
+
+```
+
+```{r}
+# Combine upReg and downReg into a single data frame
+alternativePromoters_combined <- rbind(alternativePromoters$upReg, alternativePromoters$downReg)
+
+# Assume row_data_df contains columns promoterId and geneId
+combine_alternative_promoter_df <- promoter_df %>%
+  dplyr::filter(promoterId %in% alternativePromoters_combined$promoterId & 
+                geneId %in% alternativePromoters_combined$geneId)
+
+# Display the result
+combine_alternative_promoter_df[, c(1, 2, 3, 9:14)]
+combine_alternative_promoter_df
+```
+
+### Gene information
+
+```{r}
+# Assuming combine_alternative_promoter_df is your data frame containing geneId
+# Extract gene IDs from the dataframe
+ensembl.genes <- combine_alternative_promoter_df$geneId
+
+# Remove version suffix (e.g., '.11', '.12', etc.)
+ensembl.genes <- gsub("\\..*", "", ensembl.genes)
+
+# Connect to the Ensembl GRCh37 database using biomaRt
+ensembl37 <- useMart(host = "https://grch37.ensembl.org", 
+                     biomart = "ENSEMBL_MART_ENSEMBL", 
+                     dataset = "hsapiens_gene_ensembl")
+
+# Query the Ensembl database for the relevant information
+gene_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", 
+                                  "chromosome_name", "start_position", 
+                                  "end_position", "gene_biotype", "description"),
+                   filters = "ensembl_gene_id", 
+                   values = ensembl.genes, 
+                   mart = ensembl37)
+
+# Convert chromosome names to a factor with levels in correct order
+gene_info$chromosome_name <- factor(gene_info$chromosome_name,
+                                    levels = c(1:22, "X", "Y", "MT"))
+
+# Sort the data frame by chromosome name and start position
+gene_info <- gene_info %>%
+  arrange(chromosome_name, start_position)
+
+# Print the sorted gene information
+print(gene_info)
+```
+
+### The presence of alternative promoters increases in high-grade samples.
+
+```{r}
+plots_up <- boxplotPromoters(result, "ENSG00000085832.12")
+
+# Boxplot of absolute promoter activity
+grid.arrange(plots_up[[1]], plots_up[[3]], nrow = 1, ncol = 2, widths = c(3, 2))
+```
+
+### The presence of alternative promoters decreases in high-grade samples.
+
+```{r}
+plots_down <- boxplotPromoters(result, "ENSG00000159692.11")
+
+# Boxplot of absolute promoter activity
+grid.arrange(plots_down[[1]], plots_down[[3]], nrow = 1, ncol = 2, widths = c(3, 2))
+```
+
