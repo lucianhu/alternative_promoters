@@ -1,0 +1,270 @@
+---
+title: "Alternative_promoter"
+author: "Quynh Nhu Nguyen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3   # Optional: Specify the depth of headers to include in the TOC
+  pdf_document:
+    toc: true
+    toc_depth: 3   # Optional: Specify the depth of headers to include in the TOC
+---
+
+# A complete workflow to identify alternative promoter usage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load the necessary libraries
+
+```{r}
+library(proActiv)   # For promoter analysis
+library(gridExtra)  # For arranging multiple plots
+library(Rtsne)      # For t-SNE dimensionality reduction
+library(ggplot2)    # For creating plots and visualizations
+library(SummarizedExperiment)
+library(tidyr)
+library(biomaRt)
+
+library(dplyr)
+```
+
+## Preparing promoter annotations
+
+```{r}
+## Define the GTF file path for promoter annotation
+gtf_file_hg19 <- '/mnt/NAS4/user_data/np-nhu/rna_human/genome/gencode.v19.annotation.gtf.gz'
+file.exists(gtf_file_hg19) # Check if the GTF file exists
+
+## Prepare promoter annotation using the GTF file for Homo sapiens
+promoterAnnotation_gencode_v19 <- preparePromoterAnnotation(
+    file = gtf_file_hg19, 
+    species = "Homo_sapiens")
+
+## Define the TxDb file path for promoter annotation
+txdb_file_hg19 <- '/mnt/NAS4/user_data/np-nhu/rna_human/genome/gencode.v19.annotation.sqlite'
+file.exists(txdb_file_hg19) # Check if the TxDb file exists
+
+## Load the TxDb object from the SQLite file
+txdb_hg19 <- loadDb(txdb_file_hg19)
+
+## Prepare promoter annotation using the TxDb object for Homo sapiens
+promoterAnnotation_gencode_v19 <- preparePromoterAnnotation(
+    txdb = txdb_hg19, 
+    species = "Homo_sapiens")
+```
+
+## Preparing input data
+
+```{r}
+## Define the directory path containing STAR junction files
+directory_path <- '/mnt/NAS4/user_data/np-nhu/rna_human/junctions_filter_17092024_c25'
+
+## List all files in the directory with full paths
+files <- list.files(directory_path, full.names = TRUE)
+files # Display the listed files
+
+## Define the experimental conditions for the samples
+condition <- rep(c("HIGH", "LOW"), times = c(8, 13))
+condition
+```
+
+## Identifying promoters
+
+```{r}
+## Assign the promoter annotation to a variable
+promoterAnnotation <- promoterAnnotation_gencode_v19
+
+## Run the proActiv function to analyze promoter activity
+result <- proActiv(
+    files = files, 
+    promoterAnnotation = promoterAnnotation, 
+    condition = condition
+)
+
+## Display the result object
+show(result)
+```
+
+```{r}
+# Remove single-exon transcripts/promoters by eliminating entries where promoter counts are NA
+final_result <- result[complete.cases(assays(result)$promoterCounts), ]
+
+# Convert rowData to a data frame
+row_data <- rowData(final_result)
+promoter_df <- as.data.frame(row_data)
+
+# Display the first few rows of the data frame for a preview
+head(promoter_df)
+
+# Ensure 'seqnames' is a factor with a specific order: chromosomes 1 through 22, followed by 'chrX', 'chrY', and 'chrM'
+promoter_df$seqnames <- factor(promoter_df$seqnames, 
+                               levels = c(paste0("chr", 1:22), "chrX", "chrY", "chrM"))
+
+# Sort the data frame first by 'seqnames' and then by 'start' within each 'seqnames' group
+promoter_df_sorted <- promoter_df[order(promoter_df$seqnames, promoter_df$start), ]
+
+# Convert list columns in the data frame to character vectors
+# Lists are flattened into comma-separated strings for each row
+promoter_df_sorted[] <- lapply(promoter_df_sorted, function(x) {
+  if (is.list(x)) {
+    sapply(x, function(y) paste(unlist(y), collapse = ", "))
+  } else {
+    x
+  }
+})
+
+# Filter rows where 'internalPromoter' is FALSE or NA, or 'seqnames' is NA
+external_promoter_df_sorted <- promoter_df_sorted[
+  promoter_df_sorted$internalPromoter == FALSE | is.na(promoter_df_sorted$internalPromoter) | is.na(promoter_df_sorted$seqnames), ]
+
+# Save the filtered data frame to a CSV file
+write.table(external_promoter_df_sorted, 
+            file = "/mnt/NAS4/user_data/np-nhu/rna_human/external_promoter_17092024_c25.csv", 
+            sep = ",", row.names = FALSE, quote = FALSE)
+
+# Extract 'seqnames' and 'start' columns for the BED file
+external_promoter_coordinated <- external_promoter_df_sorted[ , c("seqnames", "start")]
+
+# Save the filtered promoter coordinates to a BED file without row names and headers
+write.table(external_promoter_coordinated, 
+            file = "/mnt/NAS4/user_data/np-nhu/rna_human/extermal_promoter_region_17092024_c25.bed", 
+            quote = FALSE, row.names = FALSE, col.names = FALSE, sep = "\t")
+```
+
+### Promoter category proportion
+
+```{r}
+rdata <- rowData(result)
+## Create a long dataframe summarizing cell line and promoter class
+pdata1 <- data.frame(cellLine = rep(c('HIGH', 'LOW'), each = nrow(rdata)),
+                       promoterClass = as.factor(c(rdata$HIGH.class, rdata$LOW.class)))
+
+ggplot(na.omit(pdata1)) +
+  geom_bar(aes(x = cellLine, fill = promoterClass)) + 
+  xlab('Cell Lines') + ylab('Count') +  labs(fill = 'Promoter Category') +
+  ggtitle('Categorization of Promoters')
+```
+
+### t-SNE plot with all active promoters
+
+```{r}
+## Remove inactive promoters (sparse rows)
+data <- assays(result)$absolutePromoterActivity %>% dplyr::filter(rowSums(.) > 0)
+data <- data.frame(t(data))
+data
+data$Sample <- as.factor(condition)
+
+set.seed(40) # for reproducibility
+
+# Perform t-SNE
+tsne.out <- Rtsne(as.matrix(subset(data, select = -c(Sample))), perplexity = 1)
+tsne.out
+
+# Plot the t-SNE result
+plot(x = tsne.out$Y[,1], y = tsne.out$Y[,2], 
+     bg = data$Sample, asp = 1,
+     col = 'black', pch = 24, cex = 4,
+     main = 't-SNE plot with promoters \n active in at least one sample',
+     xlab = 'T-SNE1', ylab = 'T-SNE2',
+     xlim = c(-150,150), ylim = c(-150,150))
+
+legend('topright', inset = .02, title = 'Cell Lines',
+       legend = unique(condition), pch = 24, 
+       pt.bg = 1:length(unique(condition)), cex = 1.5, bty = 'n')
+```
+
+## Identifying alternative promoters
+
+```{r}
+alternativePromoters <- getAlternativePromoters(result = result, referenceCondition = "HIGH")
+show(alternativePromoters)
+
+```
+
+```{r}
+# Combine upReg and downReg into a single data frame
+alternativePromoters_combined <- rbind(alternativePromoters$upReg, alternativePromoters$downReg)
+
+# Assume row_data_df contains columns promoterId and geneId
+combine_alternative_promoter_df <- promoter_df %>%
+  dplyr::filter(promoterId %in% alternativePromoters_combined$promoterId & 
+                geneId %in% alternativePromoters_combined$geneId)
+
+# Display the result
+combine_alternative_promoter_df[, c(1, 2, 3, 9:14)]
+combine_alternative_promoter_df
+```
+
+### Gene information
+
+```{r}
+# Load necessary libraries at once
+library(biomaRt)
+library(dplyr)
+
+# Assuming combine_alternative_promoter_df is your data frame containing geneId
+# Clean geneId by removing version suffix (e.g., '.11', '.12', etc.)
+combine_alternative_promoter_df <- combine_alternative_promoter_df %>%
+  mutate(geneId = gsub("\\..*", "", geneId))
+
+# Connect to the Ensembl GRCh37 database using biomaRt
+ensembl37 <- useMart(
+  host = "https://grch37.ensembl.org", 
+  biomart = "ENSEMBL_MART_ENSEMBL", 
+  dataset = "hsapiens_gene_ensembl"
+)
+
+# Query the Ensembl database for relevant gene information
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "external_gene_name", "chromosome_name", 
+                 "start_position", "end_position", "gene_biotype", "description"),
+  filters = "ensembl_gene_id", 
+  values = combine_alternative_promoter_df$geneId, 
+  mart = ensembl37
+)
+
+# Factor chromosome names with levels in the correct order and sort the data
+gene_info <- gene_info %>%
+  mutate(chromosome_name = factor(chromosome_name, levels = c(as.character(1:22), "X", "Y", "MT"))) %>%
+  arrange(chromosome_name, start_position)
+
+# Merge the two dataframes on the cleaned geneId
+merged_df <- combine_alternative_promoter_df %>%
+  left_join(gene_info, by = c("geneId" = "ensembl_gene_id"))
+
+# Convert list columns in the data frame to character vectors
+# Lists are flattened into comma-separated strings for each row
+merged_df[] <- lapply(merged_df, function(x) {
+  if (is.list(x)) {
+    sapply(x, function(y) paste(unlist(y), collapse = ", "))
+  } else {
+    x
+  }
+})
+
+# Save the sorted data frame to a CSV file
+write.table(merged_df, 
+            file = "/mnt/NAS4/user_data/np-nhu/rna_human//alternative_promoter_17092024_c25.csv", 
+            sep = ",", row.names = FALSE, quote = FALSE)
+```
+
+### The presence of alternative promoters increases in high-grade samples.
+
+```{r}
+plots_up <- boxplotPromoters(result, "ENSG00000130304")
+
+# Boxplot of absolute promoter activity
+grid.arrange(plots_up[[1]], plots_up[[3]], nrow = 1, ncol = 2, widths = c(3, 2))
+```
+
+### The presence of alternative promoters decreases in high-grade samples.
+
+```{r}
+plots_down <- boxplotPromoters(result, "ENSG00000159692.11")
+
+# Boxplot of absolute promoter activity
+grid.arrange(plots_down[[1]], plots_down[[3]], nrow = 1, ncol = 2, widths = c(3, 2))
+```
